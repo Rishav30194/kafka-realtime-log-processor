@@ -4,51 +4,61 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A minimal Spring Boot demo that produces synthetic log messages to a Kafka topic and
-consumes them back, filtering for `ERROR`-level entries. It is a learning/reference
-project, not a production service — there are no REST endpoints, no persistence, and
-output goes to stdout via `System.out.println`.
+A small Spring Boot + Kafka demo that generates synthetic log messages, routes the
+`ERROR`-level ones to a dedicated topic, and consumes them. It is a learning/reference
+project — there are no REST endpoints and no persistence; observable behavior is via logs.
 
 ## Build & run
 
 ```bash
-docker compose up -d          # start Kafka + Zookeeper (required before running the app)
-mvn clean package             # compile and run tests
-mvn spring-boot:run           # run the app (or: java -cp target/classes ... via your IDE)
+docker compose up -d          # start single-node Kafka (KRaft, no Zookeeper) on localhost:9092
+mvn clean package             # compile, run tests, build executable jar
+mvn spring-boot:run           # run the app
+java -jar target/kafka-realtime-log-processor-1.0-SNAPSHOT.jar   # run the packaged fat jar
 mvn test                      # run all tests
-mvn test -Dtest=ClassName#method   # run a single test
+mvn test -Dtest=LogRoutingTest#errorLogsAreRoutedToErrorTopic   # run a single test
+docker compose down           # stop the broker
 ```
 
-Note: `pom.xml` does not declare the `spring-boot-maven-plugin`, so `mvn spring-boot:run`
-and an executable fat jar are not available out of the box. The app is normally launched
-from the IDE (run `KafkaRealTimeLogProcessorApplication`). Adding the plugin to `pom.xml`
-requires explicit approval per the workspace rules.
+Kafka must be reachable at `localhost:9092` before running the app. The tests do **not**
+need Docker — they spin up an embedded broker (`@EmbeddedKafka`).
 
-Kafka must be reachable at `localhost:9092` (see `docker-compose.yml`) before the app
-starts, or the producer/consumer will fail to connect.
+Tunable producer knobs (CLI `--flag=value`, env, or `application.yml` under `app.producer`):
+`enabled` (default true), `count` (default 50), `delay-ms` (default 200).
 
 ## Architecture
 
-The whole flow lives in three classes under `com.rishav.kafka`, all wired by Spring Boot
-autoconfiguration over the `logs` topic:
+The pipeline is a chain of three beans over two topics (constants in `config/KafkaTopics`):
 
-- `producer/LogProducer` — annotated `@PostConstruct @Async`, so it fires **once at startup**
-  on a background thread. It emits 50 `LogMessage` records (random `INFO`/`DEBUG`/`ERROR`
-  level) as JSON strings via `KafkaTemplate`, keyed by level, with a 200ms gap between sends.
-  `@EnableAsync` on the main application class is what makes the `@Async` non-blocking.
-- `consumer/ErrorLogConsumer` — a `@KafkaListener` on `logs` (group `error-log-group-dev`).
-  Deserializes each message and prints only those with level `ERROR`.
-- `model/LogMessage` — Lombok POJO (`level`, `timestamp`, `message`). Serialized/deserialized
-  manually with a per-class `new ObjectMapper()` (not the Spring-managed bean).
+```
+LogProducer --> "logs" --> LogRouter --> "error-logs" --> ErrorLogConsumer
+```
 
-Messages move as plain `String` JSON: Kafka serializers are `StringSerializer`/
-`StringDeserializer` (configured in `application.yml`), and JSON conversion is done
-explicitly with Jackson in both the producer and consumer rather than via a Kafka JSON serde.
+- `producer/LogProducer` — on `ApplicationReadyEvent` (async, so startup isn't blocked) emits
+  `count` random-level `LogMessage` records as JSON to `logs`, keyed by level. Gated by
+  `app.producer.enabled` so tests can disable the startup burst. `send()` is also called
+  directly by the test.
+- `consumer/LogRouter` — `@KafkaListener` on `logs` (group `log-router`); forwards only
+  `ERROR` messages to `error-logs`.
+- `consumer/ErrorLogConsumer` — `@KafkaListener` on `error-logs` (group `error-log-group-dev`);
+  logs each error.
+- `config/KafkaTopics` — declares both topics as `NewTopic` beans (auto-created via `KafkaAdmin`)
+  and holds the topic-name constants.
+- `config/JacksonConfig` — provides the shared `ObjectMapper` bean. **Required**: the plain
+  (non-web) `spring-boot-starter` does not autoconfigure one.
+
+Messages move as plain `String` JSON: Kafka uses String serdes (see `application.yml`), and
+Jackson conversion is done explicitly in the producer/router/consumer.
 
 ## Conventions specific to this repo
 
-- Java 22 (`maven.compiler.release` in `pom.xml`).
-- Lombok is used for model boilerplate (`@Getter/@Setter/@AllArgsConstructor` etc.).
-- The consumer group id is duplicated in both `application.yml` and the `@KafkaListener`
-  annotation — keep them in sync if you change it.
-- There are currently no test classes despite the JUnit 5 setup in `pom.xml`.
+- Java 22 (`maven.compiler.release`).
+- Dependency versions are governed by the imported `spring-boot-dependencies` BOM — do **not**
+  re-pin Spring/Kafka/Jackson/logging versions on individual dependencies, or you risk the kind
+  of transitive split (e.g. `logback-core` vs `logback-classic`) the BOM exists to prevent.
+- Each `@KafkaListener` declares its own `groupId`; there is intentionally no global
+  `spring.kafka.consumer.group-id`, so the two consumers stay in separate groups.
+- Lombok is used for the `LogMessage` model.
+- `LogRoutingTest` uses `@EmbeddedKafka` and points `spring.kafka.bootstrap-servers` at
+  `${spring.embedded.kafka.brokers}`; it seeks the test consumer to the end of `error-logs`
+  before producing so leftover records from other tests don't leak in.

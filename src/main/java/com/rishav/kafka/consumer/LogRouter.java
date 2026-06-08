@@ -8,19 +8,24 @@ import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 @Service
 @RequiredArgsConstructor
-public class ErrorLogConsumer {
+public class LogRouter {
 
-    private static final Logger log = LoggerFactory.getLogger(ErrorLogConsumer.class);
+    private static final Logger log = LoggerFactory.getLogger(LogRouter.class);
 
     private final ObjectMapper objectMapper;
+    private final KafkaTemplate<String, String> kafkaTemplate;
 
-    @KafkaListener(topics = KafkaTopics.ERROR_LOGS, groupId = "error-log-group-dev")
-    public void consume(String message) throws JsonProcessingException {
+    @KafkaListener(topics = KafkaTopics.LOGS, groupId = "log-router")
+    public void route(String message) throws JsonProcessingException {
         LogMessage logMessage = objectMapper.readValue(message, LogMessage.class);
-        log.error("Error log received: {}", logMessage);
+        if ("ERROR".equalsIgnoreCase(logMessage.getLevel())) {
+            kafkaTemplate.send(KafkaTopics.ERROR_LOGS, logMessage.getLevel(), message);
+            log.debug("Routed error log to {}", KafkaTopics.ERROR_LOGS);
+        }
     }
 }
